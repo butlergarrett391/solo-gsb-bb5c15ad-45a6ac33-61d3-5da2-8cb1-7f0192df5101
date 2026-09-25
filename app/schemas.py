@@ -99,6 +99,43 @@ class WindowQueryResult(BaseModel):
     windows: list[DepartureWindow] = Field(description="全部可出发时段")
 
 
+class BridgeConfig(BaseModel):
+    """桥梁配置：每港一处，梁底高程相对潮高基准面；重复设置即覆盖。"""
+
+    beam_elevation: float = Field(description="桥梁梁底高程（米，相对潮高基准面）")
+
+
+class BridgeOut(BaseModel):
+    port_id: int
+    beam_elevation: float = Field(description="桥梁梁底高程（米，相对潮高基准面）")
+
+
+class BridgeWindowQuery(BaseModel):
+    """桥梁净空通航窗口查询：吃水、水深富余、水面以上高度、净空富余与正数通航分钟数。"""
+
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    depth_margin: float = Field(ge=0, description="水深富余（米）")
+    air_draft: float = Field(ge=0, description="船舶水面以上高度（米）")
+    clearance_margin: float = Field(ge=0, description="净空富余（米）")
+    duration_minutes: float = Field(gt=0, description="所需通航时长（分钟），必须为正数")
+
+
+class BridgeWindowQueryResult(BaseModel):
+    port_id: int
+    beam_elevation: float = Field(description="桥梁梁底高程（米，相对潮高基准面）")
+    required_depth: float = Field(description="所需水深 = 吃水 + 水深富余（米）")
+    required_clearance: float = Field(
+        description="所需净空 = 船舶水面以上高度 + 净空富余（米）"
+    )
+    duration_minutes: float
+    earliest_departure: UtcDatetime | None = Field(
+        description="最早可出发时刻；无可出发时段时为 null"
+    )
+    windows: list[DepartureWindow] = Field(
+        description="水深与净空双条件同时达标的全部可出发时段"
+    )
+
+
 class BookableWindowQuery(BaseModel):
     """可预约时段查询：吃水、安全富余、正数通航分钟数与允许出发起止时刻。"""
 

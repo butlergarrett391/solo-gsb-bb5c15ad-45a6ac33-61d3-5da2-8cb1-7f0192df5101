@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.tides import (
     bookable_departure_windows,
+    bridge_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
@@ -12,6 +13,7 @@ from app.tides import (
     merge_forecast_points,
     observation_anomalies,
     sufficient_depth_windows,
+    sufficient_tide_band_windows,
 )
 
 BASE = datetime(2026, 9, 24, tzinfo=timezone.utc)
@@ -417,6 +419,192 @@ def test_audit_deficit_stops_at_forecast_coverage_edge():
 # ---------------------------------------------------------------------------
 # earliest_feasible_departure / max_supported_required_depth：最大可通航吃水
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# sufficient_tide_band_windows / bridge_departure_windows：桥梁净空通航窗口
+# ---------------------------------------------------------------------------
+
+
+def test_band_windows_single_tide_cycle_two_entries():
+    # 潮高 0.5→3.0→0.5（00:00/03:00/06:00），带 [1.0, 1.5]：
+    # 上升段 00:36 入带、01:12 出带；下降段 04:48 入带、05:24 出带
+    windows = sufficient_tide_band_windows(
+        pts(0.5, 3.0, 0.5, step_minutes=180), tide_min=1.0, tide_max=1.5
+    )
+    assert windows == [
+        (
+            (BASE + timedelta(minutes=36)).timestamp(),
+            (BASE + timedelta(minutes=72)).timestamp(),
+        ),
+        (
+            (BASE + timedelta(hours=4, minutes=48)).timestamp(),
+            (BASE + timedelta(hours=5, minutes=24)).timestamp(),
+        ),
+    ]
+
+
+def test_band_windows_exact_bounds_included():
+    # 等号可通行：潮高恒等于下界 / 上界，整段预报覆盖区间纳入
+    windows = sufficient_tide_band_windows(pts(1.0, 1.0), tide_min=1.0, tide_max=1.5)
+    assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=1)).timestamp())]
+    windows = sufficient_tide_band_windows(pts(1.5, 1.5), tide_min=1.0, tide_max=1.5)
+    assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=1)).timestamp())]
+
+
+def test_band_windows_touches_band_at_segment_vertex():
+    # 高潮 01:00 恰为带的上界 1.5（等号可通行）：上升与下降两段在 01:00
+    # 相接，合并为一个连续窗口
+    windows = sufficient_tide_band_windows(
+        pts(0.5, 1.5, 0.5), tide_min=1.0, tide_max=1.5
+    )
+    assert windows == [
+        (
+            (BASE + timedelta(minutes=30)).timestamp(),
+            (BASE + timedelta(hours=1, minutes=30)).timestamp(),
+        )
+    ]
+
+
+def test_band_windows_merges_adjacent_segments():
+    # 潮高 1.2→1.4→1.2 全程在带 [1.0, 1.5] 内：相邻段相接，合并为一个窗口
+    windows = sufficient_tide_band_windows(pts(1.2, 1.4, 1.2), 1.0, 1.5)
+    assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=2)).timestamp())]
+
+
+def test_band_windows_two_separate_band_passes():
+    # 潮高 0.5→2.0→0.5（每 60 分钟），带 [1.0, 1.5]：
+    # 上升 00:20 入带、00:40 出带；下降 01:20 入带、01:40 出带
+    windows = sufficient_tide_band_windows(pts(0.5, 2.0, 0.5), 1.0, 1.5)
+    assert windows == [
+        (
+            (BASE + timedelta(minutes=20)).timestamp(),
+            (BASE + timedelta(minutes=40)).timestamp(),
+        ),
+        (
+            (BASE + timedelta(hours=1, minutes=20)).timestamp(),
+            (BASE + timedelta(hours=1, minutes=40)).timestamp(),
+        ),
+    ]
+
+
+def test_band_windows_clipped_at_forecast_coverage():
+    # 全程在带内时窗口就是预报覆盖时段本身，不外推
+    windows = sufficient_tide_band_windows(pts(1.2, 1.3, 1.2), 1.0, 1.5)
+    assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=2)).timestamp())]
+
+
+def test_band_windows_impossible_band_empty():
+    # tide_min > tide_max：无可行潮高区间
+    assert sufficient_tide_band_windows(pts(1.0, 2.0, 1.0), 2.0, 1.0) == []
+
+
+def test_band_windows_tide_never_in_band_empty():
+    # 潮高全程低于下界 / 高于上界 → 空
+    assert sufficient_tide_band_windows(pts(0.2, 0.5, 0.2), 1.0, 1.5) == []
+    assert sufficient_tide_band_windows(pts(2.0, 3.0, 2.0), 1.0, 1.5) == []
+
+
+def test_band_windows_fewer_than_two_points():
+    assert sufficient_tide_band_windows([], 1.0, 1.5) == []
+    assert sufficient_tide_band_windows(pts(1.2), 1.0, 1.5) == []
+
+
+def test_bridge_windows_combines_depth_and_clearance():
+    # 基准水深 4.5、梁底高程 8.0：
+    # 吃水 5.0 + 水深富余 0.5 → 潮高 >= 1.0；
+    # 水面以上高度 6.0 + 净空富余 0.5 → 潮高 <= 1.5
+    # 潮高 0.5→3.0→0.5（00:00/03:00/06:00），带内窗口
+    # [00:36,01:12]、[04:48,05:24]，通航 30 分钟
+    deps, earliest = bridge_departure_windows(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, beam_elevation=8.0,
+        draft=5.0, depth_margin=0.5, air_draft=6.0, clearance_margin=0.5,
+        duration_seconds=1800,
+    )
+    assert deps == [
+        (BASE + timedelta(minutes=36), BASE + timedelta(minutes=42)),
+        (BASE + timedelta(hours=4, minutes=48), BASE + timedelta(hours=4, minutes=54)),
+    ]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_bridge_windows_duration_exactly_equals_window_kept():
+    # 带内窗口恰 36 分钟 == 通航 36 分钟 → 保留为零长度单点出发时刻
+    deps, _ = bridge_departure_windows(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, beam_elevation=8.0,
+        draft=5.0, depth_margin=0.5, air_draft=6.0, clearance_margin=0.5,
+        duration_seconds=36 * 60,
+    )
+    assert deps == [
+        (BASE + timedelta(minutes=36), BASE + timedelta(minutes=36)),
+        (BASE + timedelta(hours=4, minutes=48), BASE + timedelta(hours=4, minutes=48)),
+    ]
+
+
+def test_bridge_windows_window_shorter_than_duration_discarded():
+    # 带内窗口 36 分钟 < 通航 37 分钟 → 全部舍弃
+    deps, earliest = bridge_departure_windows(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, beam_elevation=8.0,
+        draft=5.0, depth_margin=0.5, air_draft=6.0, clearance_margin=0.5,
+        duration_seconds=37 * 60,
+    )
+    assert deps == []
+    assert earliest is None
+
+
+def test_bridge_windows_conflicting_requirements_never_pass():
+    # 水深要求潮高 >= 1.0，净空要求潮高 <= 0.8（梁底 8.0，所需净空 7.2）
+    # → 两条件无交集，任何潮高都不可通行
+    deps, earliest = bridge_departure_windows(
+        pts(0.5, 3.0, 0.5, step_minutes=180),
+        reference_depth=4.5, beam_elevation=8.0,
+        draft=5.0, depth_margin=0.5, air_draft=6.9, clearance_margin=0.3,
+        duration_seconds=60,
+    )
+    assert deps == []
+    assert earliest is None
+
+
+def test_bridge_windows_high_bridge_clearance_never_binds():
+    # 梁底极高，净空条件恒满足：结果与纯水深窗口一致 [00:36, 01:30]（通航 0）
+    deps, earliest = bridge_departure_windows(
+        pts(1.0, 3.0, 1.0),
+        reference_depth=3.0, beam_elevation=1000.0,
+        draft=5.0, depth_margin=0.0, air_draft=10.0, clearance_margin=0.0,
+        duration_seconds=60,
+    )
+    assert deps == [
+        (BASE + timedelta(minutes=30), BASE + timedelta(hours=1, minutes=29))
+    ]
+    assert earliest == BASE + timedelta(minutes=30)
+
+
+def test_bridge_windows_equality_at_both_bounds_passable():
+    # 平潮恒 1.0，潮高上下界恰为 1.0（等号同时成立）：整段覆盖可通航。
+    # pts(1.0, 1.0) 覆盖 [00:00, 01:00]（60 分钟），通航 30 分钟
+    # → 可出发 [00:00, 00:30]
+    deps, earliest = bridge_departure_windows(
+        pts(1.0, 1.0),
+        reference_depth=4.5, beam_elevation=7.5,
+        draft=5.0, depth_margin=0.5, air_draft=6.0, clearance_margin=0.5,
+        duration_seconds=1800,
+    )
+    assert deps == [(BASE, BASE + timedelta(minutes=30))]
+    assert earliest == BASE
+
+
+def test_bridge_windows_fewer_than_two_forecast_points():
+    deps, earliest = bridge_departure_windows(
+        pts(1.0),
+        reference_depth=4.5, beam_elevation=8.0,
+        draft=5.0, depth_margin=0.5, air_draft=6.0, clearance_margin=0.5,
+        duration_seconds=60,
+    )
+    assert deps == []
+    assert earliest is None
 
 
 def test_earliest_feasible_departure_intersects_allowed_range():

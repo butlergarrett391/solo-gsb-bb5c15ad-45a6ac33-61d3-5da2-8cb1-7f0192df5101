@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS tide_observations (
 CREATE INDEX IF NOT EXISTS idx_tide_observations_port
     ON tide_observations (port_id, obs_time);
 
+CREATE TABLE IF NOT EXISTS bridges (
+    port_id        INTEGER PRIMARY KEY
+        REFERENCES ports(id) ON DELETE CASCADE,   -- 每港至多一处桥梁
+    beam_elevation REAL NOT NULL                  -- 梁底高程（米，相对潮高基准面）
+);
+
 CREATE TABLE IF NOT EXISTS reservations (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     port_id                INTEGER NOT NULL

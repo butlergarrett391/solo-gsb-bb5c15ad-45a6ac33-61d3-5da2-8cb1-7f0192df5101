@@ -25,6 +25,11 @@
 - 可预约时段查询：在潮汐可出发时段与请求允许范围的交集上，按“每条有效预约
   占用 [a, b] 禁止出发 (a−时长, b)”逐条扣除（开区间，端点保留即首尾相接允许），
   零长度但可用的单点出发时刻保留，返回剩余全部可预约出发时段（按时间升序）。
+- 桥梁净空通航窗口：潮高需同时位于
+  [吃水+水深富余−基准水深, 梁底高程−船舶水面以上高度−净空富余] 区间内（水深
+  与净空双条件同时达标，等号可通行）；按相邻预报点逐段线性插值求两条件的
+  连续交集（相接区间合并），窗口结束时刻减去通航时长得到可出发时段，不足
+  时长的窗口舍弃（纯内存计算，仅在预报覆盖时段内求值）。
 """
 from __future__ import annotations
 
@@ -109,6 +114,121 @@ def departure_windows(
     """
     result: list[tuple[datetime, datetime]] = []
     for start_ts, end_ts in sufficient_depth_windows(points, reference_depth, required_depth):
+        if end_ts - start_ts >= duration_seconds - _EPS:
+            result.append((_to_utc(start_ts), _to_utc(end_ts - duration_seconds)))
+    earliest = min((w[0] for w in result), default=None)
+    return result, earliest
+
+
+# ---------------------------------------------------------------------------
+# 桥梁净空通航窗口：水深与净空双条件的连续交集
+# ---------------------------------------------------------------------------
+
+
+def sufficient_tide_band_windows(
+    points: list[ForecastPoint],
+    tide_min: float,
+    tide_max: float,
+) -> list[tuple[float, float]]:
+    """返回潮高同时满足 tide_min <= 潮高 <= tide_max 的连续窗口（Unix 秒，升序）。
+
+    相邻预报点线性插值；**等号可通行**（端点恰好触及边界也纳入）；相接区间
+    合并为同一连续窗口；不足 2 个预报点或 tide_min > tide_max（无可行潮高
+    区间）时返回空。
+    """
+    if len(points) < 2 or tide_min > tide_max:
+        return []
+
+    ts = [p[0].timestamp() for p in points]
+    heights = [p[1] for p in points]
+
+    windows: list[tuple[float, float]] = []
+    cur_start: float | None = None
+    cur_end: float | None = None
+
+    def flush() -> None:
+        nonlocal cur_start, cur_end
+        if cur_start is not None:
+            windows.append((cur_start, cur_end))  # type: ignore[arg-type]
+            cur_start = cur_end = None
+
+    for i in range(len(points) - 1):
+        t0, t1 = ts[i], ts[i + 1]
+        h0, h1 = heights[i], heights[i + 1]
+
+        # 段内满足 潮高 >= tide_min 的子区间
+        above0 = h0 >= tide_min - _EPS
+        above1 = h1 >= tide_min - _EPS
+        if above0 and above1:
+            lo_seg: tuple[float, float] | None = (t0, t1)
+        elif not above0 and not above1:
+            lo_seg = None
+        elif above0:
+            lo_seg = (t0, _cross_time(t0, h0, t1, h1, tide_min))
+        else:
+            lo_seg = (_cross_time(t0, h0, t1, h1, tide_min), t1)
+
+        # 段内满足 潮高 <= tide_max 的子区间
+        below0 = h0 <= tide_max + _EPS
+        below1 = h1 <= tide_max + _EPS
+        if below0 and below1:
+            hi_seg: tuple[float, float] | None = (t0, t1)
+        elif not below0 and not below1:
+            hi_seg = None
+        elif below0:
+            hi_seg = (t0, _cross_time(t0, h0, t1, h1, tide_max))
+        else:
+            hi_seg = (_cross_time(t0, h0, t1, h1, tide_max), t1)
+
+        if lo_seg is None or hi_seg is None:
+            # 线性段内两条件之一恒不成立，整段不可通行；关闭当前窗口
+            flush()
+            continue
+        a = max(lo_seg[0], hi_seg[0])
+        b = min(lo_seg[1], hi_seg[1])
+        if a > b + 1e-6:
+            # 两子区间不相交（无可行潮高），整段不可通行；关闭当前窗口
+            flush()
+            continue
+        seg = (a, max(a, b))  # 容差内相接视为同一时刻（零长度单点）
+
+        if cur_start is None:
+            cur_start, cur_end = seg
+        elif seg[0] <= cur_end + 1e-6:  # type: ignore[operator]
+            # 相邻段首尾相接，合并为同一连续窗口
+            cur_end = max(cur_end, seg[1])  # type: ignore[type-var]
+        else:
+            flush()
+            cur_start, cur_end = seg
+
+    flush()
+    return windows
+
+
+def bridge_departure_windows(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    beam_elevation: float,
+    draft: float,
+    depth_margin: float,
+    air_draft: float,
+    clearance_margin: float,
+    duration_seconds: float,
+) -> tuple[list[tuple[datetime, datetime]], datetime | None]:
+    """桥梁净空通航窗口：水深与净空双条件同时达标的可出发时段与最早时刻。
+
+    双条件（等号可通行）换算为潮高上下界：
+    - 水深：基准水深 + 潮高 >= 吃水 + 水深富余  →  潮高 >= tide_min；
+    - 净空：梁底高程 − 潮高 >= 船舶水面以上高度 + 净空富余  →  潮高 <= tide_max。
+
+    在预报覆盖时段内求两条件的连续交集（相接区间已合并），窗口结束时刻
+    减去通航时长得到可出发时段；不足时长的窗口舍弃。
+    返回 ([(start, end), ...], earliest)，时间均为 UTC datetime。
+    """
+    tide_min = draft + depth_margin - reference_depth
+    tide_max = beam_elevation - air_draft - clearance_margin
+    result: list[tuple[datetime, datetime]] = []
+    for start_ts, end_ts in sufficient_tide_band_windows(points, tide_min, tide_max):
         if end_ts - start_ts >= duration_seconds - _EPS:
             result.append((_to_utc(start_ts), _to_utc(end_ts - duration_seconds)))
     earliest = min((w[0] for w in result), default=None)
