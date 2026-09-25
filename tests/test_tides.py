@@ -3,11 +3,13 @@ from datetime import datetime, timedelta, timezone
 
 from app.tides import (
     bookable_departure_windows,
+    bridge_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
     earliest_feasible_departure,
     earliest_scheduled_departure,
+    intersect_windows,
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
@@ -815,3 +817,106 @@ def test_observation_anomaly_duplicate_time_last_wins():
     assert len(anomalies) == 1
     assert anomalies[0][0] == BASE + timedelta(hours=3)
     assert anomalies[0][1] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# intersect_windows / bridge_departure_windows：桥梁净空通航窗口
+# ---------------------------------------------------------------------------
+
+
+def test_intersect_windows_basic_overlap():
+    a = [(0.0, 10.0), (20.0, 30.0)]
+    b = [(5.0, 25.0)]
+    assert intersect_windows(a, b) == [(5.0, 10.0), (20.0, 25.0)]
+
+
+def test_intersect_windows_touching_endpoints_merged():
+    # 相接的交集段合并为同一连续区间
+    assert intersect_windows([(0.0, 10.0)], [(0.0, 4.0), (4.0, 10.0)]) == [(0.0, 10.0)]
+    # 等号可通行：两端点相接视为相交于该点（零长度交集保留）
+    assert intersect_windows([(0.0, 5.0)], [(5.0, 9.0)]) == [(5.0, 5.0)]
+
+
+def test_intersect_windows_empty():
+    assert intersect_windows([], [(0.0, 1.0)]) == []
+    assert intersect_windows([(0.0, 1.0)], [(2.0, 3.0)]) == []
+
+
+# 基准 4.5，潮高 0.5→3.0→0.5（3 小时间隔）：水深 5.0→7.5→5.0
+BRIDGE_POINTS = [
+    (BASE, 0.5),
+    (BASE + timedelta(hours=3), 3.0),
+    (BASE + timedelta(hours=6), 0.5),
+]
+
+
+def test_bridge_windows_intersect_depth_and_clearance():
+    # 所需水深 5.5 → 水深窗口 [00:36, 05:24]
+    # 梁底 27.5、所需净空 25.0 → 潮高 ≤ 2.5：净空窗口 [00:00, 02:24] 与 [03:36, 06:00]
+    # 交集 [00:36, 02:24]、[03:36, 05:24]（各 108 分钟），60 分钟通航
+    deps, earliest = bridge_departure_windows(
+        BRIDGE_POINTS, reference_depth=4.5, required_depth=5.5,
+        bridge_bottom_elevation=27.5, required_clearance=25.0,
+        duration_seconds=3600,
+    )
+    assert deps == [
+        (BASE + timedelta(minutes=36), BASE + timedelta(hours=1, minutes=24)),
+        (BASE + timedelta(hours=3, minutes=36), BASE + timedelta(hours=4, minutes=24)),
+    ]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_bridge_windows_equality_passable():
+    # 平潮 1.0：水深恒 5.0 恰等于所需水深，梁底 26.0 − 潮高 1.0 = 25.0 恰等于
+    # 所需净空；等号可通行 → 整个预报覆盖时段可通航
+    deps, earliest = bridge_departure_windows(
+        pts(1.0, 1.0), reference_depth=4.0, required_depth=5.0,
+        bridge_bottom_elevation=26.0, required_clearance=25.0,
+        duration_seconds=1800,
+    )
+    assert deps == [(BASE, BASE + timedelta(minutes=30))]
+    assert earliest == BASE
+
+
+def test_bridge_windows_clearance_binds_around_high_tide():
+    # 梁底 26.5、所需净空 25.0 → 潮高 ≤ 1.5：净空窗口 [00:00, 01:12] 与
+    # [04:48, 06:00]，与水深窗口 [00:36, 05:24] 的交集各 36 分钟，不足 60 分钟
+    deps, earliest = bridge_departure_windows(
+        BRIDGE_POINTS, reference_depth=4.5, required_depth=5.5,
+        bridge_bottom_elevation=26.5, required_clearance=25.0,
+        duration_seconds=3600,
+    )
+    assert deps == []
+    assert earliest is None
+    # 30 分钟通航则可放入两段交集
+    deps, earliest = bridge_departure_windows(
+        BRIDGE_POINTS, reference_depth=4.5, required_depth=5.5,
+        bridge_bottom_elevation=26.5, required_clearance=25.0,
+        duration_seconds=1800,
+    )
+    assert deps == [
+        (BASE + timedelta(minutes=36), BASE + timedelta(minutes=42)),
+        (BASE + timedelta(hours=4, minutes=48), BASE + timedelta(hours=4, minutes=54)),
+    ]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_bridge_windows_high_bridge_equals_depth_only():
+    # 桥梁足够高时净空全程达标，结果与纯水深窗口一致
+    deps, earliest = bridge_departure_windows(
+        BRIDGE_POINTS, reference_depth=4.5, required_depth=5.5,
+        bridge_bottom_elevation=100.0, required_clearance=25.0,
+        duration_seconds=3600,
+    )
+    assert deps == [(BASE + timedelta(minutes=36), BASE + timedelta(hours=4, minutes=24))]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_bridge_windows_fewer_than_two_points_no_coverage():
+    deps, earliest = bridge_departure_windows(
+        [(BASE, 5.0)], reference_depth=4.5, required_depth=5.5,
+        bridge_bottom_elevation=27.5, required_clearance=25.0,
+        duration_seconds=3600,
+    )
+    assert deps == []
+    assert earliest is None

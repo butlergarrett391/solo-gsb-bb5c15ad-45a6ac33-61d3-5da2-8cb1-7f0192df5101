@@ -42,6 +42,13 @@
   有效预约占用（每条预约按请求通航时长换算为禁止出发开区间，与既有通航首尾
   相接允许，零长度但可用的单点出发时刻保留），返回允许范围内全部可预约出发
   时段与最早时刻（按时间升序）；已取消预约不占用；查询只读。
+- 桥梁净空通航窗口：每港可配置一处桥梁梁底高程（相对潮高基准面，米），
+  PUT/GET /ports/{id}/bridge 提供设置与查询；POST /ports/{id}/bridge-windows
+  提交吃水、水深富余、船舶水面以上高度、净空富余及正数通航分钟数，按最新
+  潮高预报逐段线性插值，同时要求 基准水深+潮高≥吃水+水深富余 且
+  梁底高程−潮高≥船舶水面以上高度+净空富余（等号可通行），求两条件的连续
+  交集（合并相接区间）再减去通航时长，返回全部可出发时段及最早时刻；仅在
+  预报覆盖范围内计算，预报更正后实时重算；港口或桥梁配置不存在时明确报错。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -54,6 +61,10 @@ from .database import get_db, init_db, locked_reservation_tx, port_lock
 from .schemas import (
     BookableWindowQuery,
     BookableWindowResult,
+    BridgeConfigOut,
+    BridgeConfigUpsert,
+    BridgeWindowQuery,
+    BridgeWindowQueryResult,
     DepartureWindow,
     DepthAuditDeficit,
     DepthAuditResult,
@@ -78,6 +89,7 @@ from .schemas import (
 )
 from .tides import (
     bookable_departure_windows,
+    bridge_departure_windows,
     calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
@@ -96,7 +108,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -418,6 +430,91 @@ def query_max_draft(port_id: int, payload: MaxDraftQuery, db: Connection = Depen
         required_depth=required_depth,
         departure_start=departure,
         departure_end=departure + timedelta(seconds=duration_seconds),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 桥梁净空通航窗口
+# ---------------------------------------------------------------------------
+
+
+def _get_bridge_or_404(db: Connection, port_id: int):
+    row = db.execute(
+        "SELECT bridge_bottom_elevation FROM bridge_configs WHERE port_id = ?",
+        (port_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"港口 {port_id} 未配置桥梁（梁底高程）"
+        )
+    return row
+
+
+@app.put("/ports/{port_id}/bridge", response_model=BridgeConfigOut)
+def set_bridge_config(
+    port_id: int, payload: BridgeConfigUpsert, db: Connection = Depends(get_db)
+):
+    """设置/更正港口桥梁净空配置：每港一处桥梁，重复提交即覆盖。"""
+    _get_port_or_404(db, port_id)
+    db.execute(
+        """
+        INSERT INTO bridge_configs (port_id, bridge_bottom_elevation)
+        VALUES (?, ?)
+        ON CONFLICT (port_id)
+        DO UPDATE SET bridge_bottom_elevation = excluded.bridge_bottom_elevation
+        """,
+        (port_id, payload.bridge_bottom_elevation),
+    )
+    return BridgeConfigOut(
+        port_id=port_id, bridge_bottom_elevation=payload.bridge_bottom_elevation
+    )
+
+
+@app.get("/ports/{port_id}/bridge", response_model=BridgeConfigOut)
+def get_bridge_config(port_id: int, db: Connection = Depends(get_db)):
+    """查询港口桥梁净空配置；港口或桥梁配置不存在时返回 404。"""
+    _get_port_or_404(db, port_id)
+    row = _get_bridge_or_404(db, port_id)
+    return BridgeConfigOut(
+        port_id=port_id, bridge_bottom_elevation=row["bridge_bottom_elevation"]
+    )
+
+
+@app.post("/ports/{port_id}/bridge-windows", response_model=BridgeWindowQueryResult)
+def query_bridge_windows(
+    port_id: int, payload: BridgeWindowQuery, db: Connection = Depends(get_db)
+):
+    """桥梁净空通航窗口查询（只读）。
+
+    按最新潮高预报逐段线性插值，同时要求
+    基准水深 + 潮高 ≥ 吃水 + 水深富余 且
+    梁底高程 − 潮高 ≥ 船舶水面以上高度 + 净空富余（等号可通行）；
+    求两条件的连续交集（合并相接区间），再减去通航时长，返回全部可出发
+    时段与最早出发时刻。仅在预报覆盖范围内计算；每次查询都基于数据库中
+    最新的预报点实时重算，预报点更正后立即生效。
+    """
+    port = _get_port_or_404(db, port_id)
+    bridge = _get_bridge_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+
+    required_depth = payload.draft + payload.depth_margin
+    required_clearance = payload.air_draft + payload.clearance_margin
+    windows, earliest = bridge_departure_windows(
+        points,
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        bridge_bottom_elevation=bridge["bridge_bottom_elevation"],
+        required_clearance=required_clearance,
+        duration_seconds=payload.duration_minutes * 60,
+    )
+    return BridgeWindowQueryResult(
+        port_id=port_id,
+        bridge_bottom_elevation=bridge["bridge_bottom_elevation"],
+        required_depth=required_depth,
+        required_clearance=required_clearance,
+        duration_minutes=payload.duration_minutes,
+        earliest_departure=earliest,
+        windows=[DepartureWindow(start=s, end=e) for s, e in windows],
     )
 
 

@@ -280,3 +280,44 @@ class ForecastImpactChange(BaseModel):
     preview_sufficient: bool = Field(
         description="按合并后临时预报判定：排定通航区间是否全程水深达标"
     )
+
+
+class BridgeConfigUpsert(BaseModel):
+    """设置桥梁净空配置：每港一处桥梁，重复提交即覆盖（更正）。"""
+
+    bridge_bottom_elevation: float = Field(
+        description="桥梁梁底高程（米，相对潮高基准面，与潮高预报同一基准）"
+    )
+
+
+class BridgeConfigOut(BaseModel):
+    port_id: int
+    bridge_bottom_elevation: float = Field(
+        description="桥梁梁底高程（米，相对潮高基准面）"
+    )
+
+
+class BridgeWindowQuery(BaseModel):
+    """桥梁净空通航窗口查询：吃水、水深富余、船舶水面以上高度、净空富余与正数通航分钟数。"""
+
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    depth_margin: float = Field(ge=0, description="水深富余（米）")
+    air_draft: float = Field(ge=0, description="船舶水面以上高度（米）")
+    clearance_margin: float = Field(ge=0, description="净空富余（米）")
+    duration_minutes: float = Field(gt=0, description="所需通航时长（分钟），必须为正数")
+
+
+class BridgeWindowQueryResult(BaseModel):
+    port_id: int
+    bridge_bottom_elevation: float = Field(description="桥梁梁底高程（米，相对潮高基准面）")
+    required_depth: float = Field(description="所需水深 = 吃水 + 水深富余（米）")
+    required_clearance: float = Field(
+        description="所需净空 = 船舶水面以上高度 + 净空富余（米）"
+    )
+    duration_minutes: float
+    earliest_departure: UtcDatetime | None = Field(
+        description="最早可出发时刻；无可出发时段时为 null"
+    )
+    windows: list[DepartureWindow] = Field(
+        description="水深与净空两条件连续交集减去通航时长后的全部可出发时段"
+    )

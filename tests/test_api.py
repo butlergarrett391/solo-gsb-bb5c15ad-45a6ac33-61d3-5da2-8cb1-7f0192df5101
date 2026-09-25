@@ -1524,3 +1524,163 @@ def test_bookable_windows_validation_and_404(client):
     ).status_code == 422
     # 未知港口 → 404
     assert client.post("/ports/999/bookable-windows", json=BOOKABLE_BODY).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 桥梁净空通航窗口
+# PUT/GET /ports/{id}/bridge、POST /ports/{id}/bridge-windows
+# ---------------------------------------------------------------------------
+
+# 示例港：基准 4.5，潮高 0.5→3.0→0.5（00:00/03:00/06:00），梁底高程 27.5
+# 吃水 5.0 + 水深富余 0.5 → 水深窗口 [00:36, 05:24]
+# 水面以上高度 24.0 + 净空富余 1.0 = 所需净空 25.0 → 潮高 ≤ 2.5
+# → 净空窗口 [00:00, 02:24] 与 [03:36, 06:00]
+BRIDGE_WINDOW_BODY = {
+    "draft": 5.0,
+    "depth_margin": 0.5,
+    "air_draft": 24.0,
+    "clearance_margin": 1.0,
+    "duration_minutes": 60,
+}
+
+
+def _setup_bridge_port(client, elevation=27.5):
+    port_id = _setup_port(client)
+    r = client.put(
+        f"/ports/{port_id}/bridge", json={"bridge_bottom_elevation": elevation}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"port_id": port_id, "bridge_bottom_elevation": elevation}
+    return port_id
+
+
+def test_bridge_config_set_get_and_overwrite(client):
+    port_id = _setup_bridge_port(client)
+    assert client.get(f"/ports/{port_id}/bridge").json() == {
+        "port_id": port_id,
+        "bridge_bottom_elevation": 27.5,
+    }
+    # 重复提交即覆盖（更正）
+    r = client.put(
+        f"/ports/{port_id}/bridge", json={"bridge_bottom_elevation": 26.0}
+    )
+    assert r.status_code == 200
+    got = client.get(f"/ports/{port_id}/bridge").json()
+    assert got["bridge_bottom_elevation"] == 26.0
+
+
+def test_bridge_config_404s(client):
+    # 港口不存在
+    assert client.put(
+        "/ports/999/bridge", json={"bridge_bottom_elevation": 27.5}
+    ).status_code == 404
+    assert client.get("/ports/999/bridge").status_code == 404
+    # 港口存在但未配置桥梁 → 明确报错
+    port_id = _setup_port(client)
+    r = client.get(f"/ports/{port_id}/bridge")
+    assert r.status_code == 404
+    assert "桥梁" in r.json()["detail"]
+
+
+def test_bridge_windows_intersect_two_conditions(client):
+    port_id = _setup_bridge_port(client)
+    r = client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["port_id"] == port_id
+    assert body["bridge_bottom_elevation"] == 27.5
+    assert body["required_depth"] == 5.5
+    assert body["required_clearance"] == 25.0
+    assert body["duration_minutes"] == 60.0
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    # 交集 [00:36, 02:24]、[03:36, 05:24] 各 108 分钟，减去 60 分钟通航时长
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T01:24:00+00:00"},
+        {"start": "2026-09-24T03:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"},
+    ]
+
+
+def test_bridge_windows_equality_passable_single_window(client):
+    # 梁底 28.0：所需净空 25.0 → 潮高 ≤ 3.0，高潮恰等可通行 → 净空全程达标
+    port_id = _setup_bridge_port(client, elevation=28.0)
+    body = client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY).json()
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_bridge_windows_short_intersection_discarded(client):
+    # 梁底 26.5：潮高 ≤ 1.5 → 净空窗口 [00:00, 01:12] 与 [04:48, 06:00]，
+    # 与水深窗口 [00:36, 05:24] 的交集各 36 分钟，不足 60 分钟 → 舍弃
+    port_id = _setup_bridge_port(client, elevation=26.5)
+    body = client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY).json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+    # 30 分钟通航则可放入两段交集
+    body = client.post(
+        f"/ports/{port_id}/bridge-windows",
+        json={**BRIDGE_WINDOW_BODY, "duration_minutes": 30},
+    ).json()
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T00:42:00+00:00"},
+        {"start": "2026-09-24T04:48:00+00:00", "end": "2026-09-24T04:54:00+00:00"},
+    ]
+
+
+def test_bridge_windows_requires_port_and_bridge(client):
+    # 港口存在但未配置桥梁 → 明确报错
+    port_id = _setup_port(client)
+    r = client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY)
+    assert r.status_code == 404
+    assert "桥梁" in r.json()["detail"]
+    # 港口不存在
+    assert client.post(
+        "/ports/999/bridge-windows", json=BRIDGE_WINDOW_BODY
+    ).status_code == 404
+
+
+def test_bridge_windows_recompute_after_forecast_correction(client):
+    port_id = _setup_bridge_port(client)
+    # 更正高潮点 3.0 → 1.0：水深峰值仅 5.5，只剩零长窗口，不足 60 分钟
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    body = client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY).json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+
+
+def test_bridge_windows_no_forecasts_returns_empty(client):
+    r = client.post("/ports", json={"name": "无预报桥港", "reference_depth": 10.0})
+    port_id = r.json()["id"]
+    client.put(f"/ports/{port_id}/bridge", json={"bridge_bottom_elevation": 27.5})
+    body = client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY).json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+
+
+def test_bridge_windows_validation(client):
+    port_id = _setup_bridge_port(client)
+    # 通航时长非正 → 422
+    assert client.post(
+        f"/ports/{port_id}/bridge-windows",
+        json={**BRIDGE_WINDOW_BODY, "duration_minutes": 0},
+    ).status_code == 422
+    # 吃水 / 水深富余 / 水面以上高度 / 净空富余为负 → 422
+    for field in ("draft", "depth_margin", "air_draft", "clearance_margin"):
+        assert client.post(
+            f"/ports/{port_id}/bridge-windows",
+            json={**BRIDGE_WINDOW_BODY, field: -0.1},
+        ).status_code == 422
+
+
+def test_bridge_windows_query_is_read_only(client):
+    port_id = _setup_bridge_port(client)
+    client.post(f"/ports/{port_id}/bridge-windows", json=BRIDGE_WINDOW_BODY)
+    # 查询只读：预报点与桥梁配置均不变
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]
+    got = client.get(f"/ports/{port_id}/bridge").json()
+    assert got["bridge_bottom_elevation"] == 27.5

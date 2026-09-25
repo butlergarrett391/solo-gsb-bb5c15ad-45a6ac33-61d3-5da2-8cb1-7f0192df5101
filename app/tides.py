@@ -25,6 +25,10 @@
 - 可预约时段查询：在潮汐可出发时段与请求允许范围的交集上，按“每条有效预约
   占用 [a, b] 禁止出发 (a−时长, b)”逐条扣除（开区间，端点保留即首尾相接允许），
   零长度但可用的单点出发时刻保留，返回剩余全部可预约出发时段（按时间升序）。
+- 桥梁净空通航窗口：水深条件（基准水深 + 潮高 >= 吃水 + 水深富余）与净空条件
+  （梁底高程 − 潮高 >= 船舶水面以上高度 + 净空富余，等价于对取反潮高序列复用
+  达标窗口计算）在预报覆盖时段内按相邻点线性插值判定，等号可通行；求两条件的
+  连续交集（相接区间合并）后减去通航时长得到可出发时段，不足时长的舍弃。
 """
 from __future__ import annotations
 
@@ -97,6 +101,17 @@ def sufficient_depth_windows(
     return windows
 
 
+def _to_departure_windows(
+    windows_ts: list[tuple[float, float]], duration_seconds: float
+) -> list[tuple[datetime, datetime]]:
+    """达标窗口（Unix 秒）减去通航时长得到可出发时段；不足时长的窗口舍弃。"""
+    result: list[tuple[datetime, datetime]] = []
+    for start_ts, end_ts in windows_ts:
+        if end_ts - start_ts >= duration_seconds - _EPS:
+            result.append((_to_utc(start_ts), _to_utc(end_ts - duration_seconds)))
+    return result
+
+
 def departure_windows(
     points: list[ForecastPoint],
     reference_depth: float,
@@ -107,10 +122,68 @@ def departure_windows(
 
     返回 ([(start, end), ...], earliest)，时间均为 UTC datetime。
     """
-    result: list[tuple[datetime, datetime]] = []
-    for start_ts, end_ts in sufficient_depth_windows(points, reference_depth, required_depth):
-        if end_ts - start_ts >= duration_seconds - _EPS:
-            result.append((_to_utc(start_ts), _to_utc(end_ts - duration_seconds)))
+    result = _to_departure_windows(
+        sufficient_depth_windows(points, reference_depth, required_depth),
+        duration_seconds,
+    )
+    earliest = min((w[0] for w in result), default=None)
+    return result, earliest
+
+
+def intersect_windows(
+    a: list[tuple[float, float]], b: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """两组连续窗口（Unix 秒闭区间，各自按时间升序且互不重叠）的连续交集。
+
+    等号可通行：两窗口端点相接（含浮点容差）视为相交于该点；
+    相接的交集段合并为同一连续区间，结果仍按时间升序。
+    """
+    merged: list[tuple[float, float]] = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        lo = max(a[i][0], b[j][0])
+        hi = min(a[i][1], b[j][1])
+        if lo <= hi + _EPS:
+            hi = max(lo, hi)  # 容差内相接：视为交于一点
+            if merged and lo <= merged[-1][1] + 1e-6:
+                # 与上一段交集首尾相接，合并为同一连续区间
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return merged
+
+
+def bridge_departure_windows(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    required_depth: float,
+    bridge_bottom_elevation: float,
+    required_clearance: float,
+    duration_seconds: float,
+) -> tuple[list[tuple[datetime, datetime]], datetime | None]:
+    """桥梁净空通航窗口：水深与净空两条件的连续交集减去通航时长。
+
+    - 水深条件：基准水深 + 潮高 >= 所需水深（吃水 + 水深富余）；
+    - 净空条件：梁底高程 − 潮高 >= 所需净空（船舶水面以上高度 + 净空富余），
+      等价于对取反潮高序列复用 sufficient_depth_windows；
+    - 两条件均在预报覆盖时段内按相邻点线性插值判定，等号可通行；
+    - 连续交集的相接区间合并后，再减去通航时长得到可出发时段
+      （不足时长的窗口舍弃）。
+
+    返回 ([(start, end), ...], earliest)，时间均为 UTC datetime。
+    """
+    depth_windows = sufficient_depth_windows(points, reference_depth, required_depth)
+    # 梁底高程 − 潮高 >= 所需净空  ⟺  梁底高程 + (−潮高) >= 所需净空
+    clearance_windows = sufficient_depth_windows(
+        [(t, -h) for t, h in points], bridge_bottom_elevation, required_clearance
+    )
+    result = _to_departure_windows(
+        intersect_windows(depth_windows, clearance_windows), duration_seconds
+    )
     earliest = min((w[0] for w in result), default=None)
     return result, earliest
 

@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS tide_observations (
     PRIMARY KEY (port_id, obs_time)           -- 同港同一 UTC 时刻重复写入即覆盖
 );
 
+CREATE TABLE IF NOT EXISTS bridge_configs (
+    port_id                 INTEGER PRIMARY KEY  -- 每港至多一处桥梁
+        REFERENCES ports(id) ON DELETE CASCADE,
+    bridge_bottom_elevation REAL NOT NULL        -- 梁底高程（米，相对潮高基准面）
+);
+
 CREATE INDEX IF NOT EXISTS idx_tide_observations_port
     ON tide_observations (port_id, obs_time);
 
